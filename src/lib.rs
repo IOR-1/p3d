@@ -7,6 +7,7 @@ extern crate ndarray;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use gltf::{Gltf, Semantic};
 
 use obj::{load_obj, Obj, Vertex, ObjError};
 use tri_mesh::prelude::*;
@@ -39,34 +40,109 @@ pub enum AlgoType {
 }
 
 #[derive(Debug)]
+pub enum InputFileType {
+    Obj,
+    Gltf,
+    Glb,
+}
+
+#[derive(Debug)]
 pub enum P3DError {
     InvalidObject(ObjError),
     MeshError(MeshError),
     MathError,
+    UnsupportedFileType,
+    GltfError(String),
 }
 
 
-pub fn p3d_process(input: &[u8], algo: AlgoType, par1: i16, par2: i16, trans: Option<[u8;4]>) -> Result<Vec<String>, P3DError> {
-    p3d_process_n(input, algo, 10, par1, par2, trans)
+pub fn p3d_process(input: &[u8], file_type: InputFileType, algo: AlgoType, par1: i16, par2: i16, trans: Option<[u8;4]>) -> Result<Vec<String>, P3DError> {
+    p3d_process_n(input, file_type, algo, 10, par1, par2, trans)
 }
 
 #[allow(unused_variables)]
-pub fn p3d_process_n(input: &[u8], algo: AlgoType, depth: usize, par1: i16, par2: i16, trans: Option<[u8;4]>) -> Result<Vec<String>, P3DError>
+pub fn p3d_process_n(input: &[u8], file_type: InputFileType, algo: AlgoType, depth: usize, par1: i16, par2: i16, trans: Option<[u8;4]>) -> Result<Vec<String>, P3DError>
 {
     let grid_size: i16 = par1;
     let n_sections: i16 = par2;
 
-    let model: Obj<Vertex, u32> = load_obj(input).map_err(|e| P3DError::InvalidObject(e))?;
+    let (model_vertices, model_indices): (Vec<f64>, Vec<u32>) = match file_type {
+        InputFileType::Obj => {
+            let model: Obj<Vertex, u32> = load_obj(input).map_err(|e| P3DError::InvalidObject(e))?;
+            let vertices = model.vertices
+                .iter()
+                .flat_map(|v| v.position.iter())
+                .map(|v| <f64 as NumCast>::from(*v).unwrap())
+                .collect();
+            (vertices, model.indices)
+        }
+        InputFileType::Gltf => {
+            // TODO: Implement glTF loading
+            let gltf_data = Gltf::from_slice(input).map_err(|e| P3DError::GltfError(format!("glTF parsing error: {:?}", e)))?;
+            let mut positions: Vec<[f32; 3]> = Vec::new();
+            let mut indices: Vec<u32> = Vec::new();
 
-    let vertices = model.vertices
-        .iter()
-        .flat_map(|v| v.position.iter())
-        .map(|v| <f64 as NumCast>::from(*v).unwrap())
-        .collect();
+            for mesh in gltf_data.meshes() {
+                for primitive in mesh.primitives() {
+                    let reader = primitive.reader(|buffer| Some(gltf_data.blob.as_deref().unwrap_or(&buffer.source()[..])));
+                    if let Some(pos_iter) = reader.read_positions() {
+                        positions.extend(pos_iter);
+                    }
+                    if let Some(indices_iter) = reader.read_indices() {
+                        indices.extend(indices_iter.into_u32());
+                    }
+                    if !positions.is_empty() && !indices.is_empty() {
+                        break;
+                    }
+                }
+                if !positions.is_empty() && !indices.is_empty() {
+                    break;
+                }
+            }
+
+            if positions.is_empty() || indices.is_empty() {
+                return Err(P3DError::GltfError("No valid geometry (vertices/indices) found in glTF file".to_string()));
+            }
+
+            let model_vertices_f64: Vec<f64> = positions.into_iter().flat_map(|pos| [pos[0] as f64, pos[1] as f64, pos[2] as f64]).collect();
+            (model_vertices_f64, indices)
+        }
+        InputFileType::Glb => {
+            // TODO: Implement GLB loading
+            let gltf_data = Gltf::from_slice(input).map_err(|e| P3DError::GltfError(format!("GLB parsing error: {:?}", e)))?;
+            let mut positions: Vec<[f32; 3]> = Vec::new();
+            let mut indices: Vec<u32> = Vec::new();
+
+            for mesh in gltf_data.meshes() {
+                for primitive in mesh.primitives() {
+                    let reader = primitive.reader(|buffer| Some(gltf_data.blob.as_deref().unwrap_or(&buffer.source()[..])));
+                    if let Some(pos_iter) = reader.read_positions() {
+                        positions.extend(pos_iter);
+                    }
+                    if let Some(indices_iter) = reader.read_indices() {
+                        indices.extend(indices_iter.into_u32());
+                    }
+                    if !positions.is_empty() && !indices.is_empty() {
+                        break;
+                    }
+                }
+                if !positions.is_empty() && !indices.is_empty() {
+                    break;
+                }
+            }
+
+            if positions.is_empty() || indices.is_empty() {
+                return Err(P3DError::GltfError("No valid geometry (vertices/indices) found in GLB file".to_string()));
+            }
+
+            let model_vertices_f64: Vec<f64> = positions.into_iter().flat_map(|pos| [pos[0] as f64, pos[1] as f64, pos[2] as f64]).collect();
+            (model_vertices_f64, indices)
+        }
+    };
 
     let mut mesh = MeshBuilder::new()
-        .with_indices(model.indices)
-        .with_positions(vertices)
+        .with_indices(model_indices)
+        .with_positions(model_vertices)
         .build()
         .map_err(|e| P3DError::MeshError(e))?;
 
@@ -149,4 +225,67 @@ pub fn p3d_process_n(input: &[u8], algo: AlgoType, depth: usize, par1: i16, par2
     };
 
     Ok(res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_and_process_glb() {
+        let glb_bytes = include_bytes!("../../test-ht.glb");
+        let result = p3d_process(
+            glb_bytes,
+            InputFileType::Glb,
+            AlgoType::Grid2d,
+            20,
+            10,
+            None,
+        );
+        assert!(result.is_ok(), "Processing test-ht.glb failed: {:?}", result.err());
+        if let Ok(output_strings) = result {
+            assert!(!output_strings.is_empty(), "Processing test-ht.glb produced no output strings");
+        }
+    }
+
+    #[test]
+    fn test_malformed_glb_data() {
+        let malformed_glb_bytes: &[u8] = b"this is not a glb";
+        let result = p3d_process(
+            malformed_glb_bytes,
+            InputFileType::Glb,
+            AlgoType::Grid2d,
+            20,
+            10,
+            None,
+        );
+        assert!(matches!(result, Err(P3DError::GltfError(_))), "Malformed GLB data did not produce GltfError: {:?}", result);
+    }
+
+    #[test]
+    fn test_gltf_no_geometry() {
+        let no_geometry_gltf_json = r#"
+        {
+          "asset": { "version": "2.0" },
+          "scene": 0,
+          "scenes": [ { "nodes": [] } ],
+          "meshes": []
+        }
+        "#;
+        let no_geometry_gltf_bytes = no_geometry_gltf_json.as_bytes();
+        let result = p3d_process(
+            no_geometry_gltf_bytes,
+            InputFileType::Gltf,
+            AlgoType::Grid2d,
+            20,
+            10,
+            None,
+        );
+        assert!(matches!(result, Err(P3DError::GltfError(_))), "glTF with no geometry did not produce GltfError: {:?}", result);
+        if let Err(P3DError::GltfError(msg)) = result {
+            assert!(msg.contains("No valid geometry"), "Error message for no geometry is incorrect: {}", msg);
+        } else {
+            panic!("Expected GltfError for glTF with no geometry, but got Ok or other error: {:?}", result);
+        }
+    }
 }
